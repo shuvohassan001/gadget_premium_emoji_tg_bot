@@ -19,12 +19,14 @@ Notes:
 import os
 import re
 import time
+import json
 import uuid
 import random
 import logging
 import threading
 import traceback
 import zipfile
+import urllib.request
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -1779,29 +1781,256 @@ def has_unicode_emoji(text):
         return False
 
 
-def smart_emoji_suggestions(text):
-    lower = (text or "").lower()
-    rules = [
-        (("love", "heart", "romantic"), ["❤️", "😍", "💖"]),
-        (("sale", "discount", "offer", "deal"), ["🔥", "💸", "⚡"]),
-        (("win", "winner", "success"), ["🏆", "🎉", "🥇"]),
-        (("new", "launch", "update"), ["🚀", "✨", "🆕"]),
-        (("gift", "bonus", "free"), ["🎁", "💎", "⭐"]),
-        (("urgent", "warning", "alert"), ["⚠️", "🚨", "❗"]),
-        (("premium", "vip", "pro"), ["💎", "👑", "⭐"]),
-    ]
-    out = []
-    for keys, vals in rules:
-        if any(k in lower for k in keys):
-            out.extend(vals)
-    if not out:
-        out = ["✨", "🔥", "⭐"]
-    seen, res = set(), []
-    for e in out:
+# ======================== AI EMOJI INTELLIGENCE ENGINE ========================
+# Context-aware suggestion engine. It reads the "vibe" of a post (intent + tone),
+# scores every intent category with weighted keywords, and returns ranked
+# premium-ready unicode emojis plus catchy hook lines. When AI_API_KEY is set it
+# upgrades to a real LLM, with a safe automatic fallback to the local engine.
+
+# Each category: weighted keyword map + curated emoji set + tone (+1/-1/0).
+AI_INTENTS = {
+    "sale":        {"tone": 1,  "emojis": ["🔥", "💥", "💸", "⚡", "🏷️", "🛒", "✅"],
+                    "kw": {"sale": 3, "discount": 3, "offer": 3, "deal": 3, "off": 1, "cheap": 2, "save": 2, "coupon": 2, "promo": 2, "buy": 1, "shop": 1, "price": 1, "% off": 3}},
+    "launch":      {"tone": 1,  "emojis": ["🚀", "✨", "🆕", "🎉", "📢", "🔓", "🌟"],
+                    "kw": {"new": 2, "launch": 3, "release": 3, "introducing": 3, "update": 2, "drop": 2, "coming soon": 3, "announce": 2, "available": 2, "version": 1}},
+    "giveaway":    {"tone": 1,  "emojis": ["🎁", "🎉", "🍀", "🎊", "🤑", "🏆", "✨"],
+                    "kw": {"giveaway": 3, "contest": 3, "win": 2, "winner": 2, "prize": 3, "lucky": 2, "draw": 2, "free": 2, "enter": 1, "participate": 2}},
+    "love":        {"tone": 1,  "emojis": ["❤️", "😍", "💖", "🥰", "💕", "😘", "💞"],
+                    "kw": {"love": 3, "heart": 2, "romantic": 3, "valentine": 3, "crush": 2, "couple": 2, "darling": 2, "sweetheart": 2, "miss you": 2}},
+    "gift":        {"tone": 1,  "emojis": ["🎁", "💎", "⭐", "🎀", "💝", "🛍️", "✨"],
+                    "kw": {"gift": 3, "bonus": 3, "free": 2, "reward": 3, "freebie": 3, "voucher": 2, "complimentary": 2, "claim": 2}},
+    "urgent":      {"tone": -1, "emojis": ["⚠️", "🚨", "❗", "⏰", "🔴", "📣", "‼️"],
+                    "kw": {"urgent": 3, "warning": 3, "alert": 3, "hurry": 3, "now": 1, "last chance": 3, "deadline": 3, "expires": 3, "ending": 2, "act fast": 3, "limited time": 3}},
+    "premium":     {"tone": 1,  "emojis": ["💎", "👑", "⭐", "🏆", "🥇", "✨", "🔱"],
+                    "kw": {"premium": 3, "vip": 3, "pro": 2, "luxury": 3, "exclusive": 3, "elite": 3, "best": 1, "top": 1, "ultimate": 2, "platinum": 2, "gold": 2}},
+    "money":       {"tone": 1,  "emojis": ["💰", "💵", "🤑", "📈", "💹", "🏦", "💸"],
+                    "kw": {"money": 3, "earn": 3, "income": 3, "profit": 3, "cash": 3, "salary": 2, "rich": 2, "wealth": 2, "invest": 2, "payout": 2, "withdraw": 2, "dollar": 1, "taka": 1}},
+    "crypto":      {"tone": 0,  "emojis": ["🪙", "📈", "🚀", "💹", "🔗", "⛓️", "💎"],
+                    "kw": {"crypto": 3, "bitcoin": 3, "btc": 3, "eth": 2, "token": 2, "blockchain": 3, "trading": 2, "wallet": 2, "nft": 2, "airdrop": 3, "web3": 2}},
+    "tech":        {"tone": 0,  "emojis": ["💻", "📱", "🤖", "⚙️", "🔌", "🖥️", "🛰️"],
+                    "kw": {"tech": 2, "gadget": 3, "app": 2, "software": 2, "ai": 2, "robot": 2, "device": 2, "smartphone": 2, "laptop": 2, "code": 2, "digital": 1, "feature": 1}},
+    "gaming":      {"tone": 1,  "emojis": ["🎮", "🕹️", "🏆", "👾", "🔥", "⚔️", "🎯"],
+                    "kw": {"game": 2, "gaming": 3, "play": 1, "level": 2, "player": 2, "esports": 3, "stream": 1, "score": 1, "match": 1, "pubg": 2, "freefire": 2}},
+    "music":       {"tone": 1,  "emojis": ["🎵", "🎶", "🎧", "🎤", "🔊", "🎸", "🥁"],
+                    "kw": {"music": 3, "song": 3, "track": 2, "album": 2, "concert": 2, "beat": 2, "playlist": 2, "remix": 2, "artist": 1, "spotify": 2}},
+    "food":        {"tone": 1,  "emojis": ["🍔", "🍕", "🍟", "😋", "🤤", "🥗", "🍰"],
+                    "kw": {"food": 3, "eat": 2, "delicious": 3, "tasty": 3, "recipe": 2, "restaurant": 2, "menu": 2, "meal": 2, "snack": 2, "hungry": 2, "foodie": 3}},
+    "travel":      {"tone": 1,  "emojis": ["✈️", "🌍", "🏖️", "🧳", "🗺️", "🏝️", "📸"],
+                    "kw": {"travel": 3, "trip": 3, "tour": 2, "flight": 2, "hotel": 2, "vacation": 3, "holiday": 2, "adventure": 2, "destination": 2, "explore": 1}},
+    "fitness":     {"tone": 1,  "emojis": ["💪", "🏋️", "🔥", "🏃", "🥗", "⚡", "🧘"],
+                    "kw": {"fitness": 3, "gym": 3, "workout": 3, "health": 2, "diet": 2, "muscle": 2, "training": 2, "weight": 1, "exercise": 3, "wellness": 2}},
+    "education":   {"tone": 1,  "emojis": ["📚", "🎓", "✏️", "🧠", "💡", "📝", "🔬"],
+                    "kw": {"learn": 3, "course": 3, "study": 3, "education": 3, "tutorial": 2, "class": 2, "school": 2, "exam": 2, "lesson": 2, "knowledge": 2, "training": 1}},
+    "celebrate":   {"tone": 1,  "emojis": ["🎉", "🎊", "🥳", "🎈", "🍾", "✨", "🎆"],
+                    "kw": {"celebrate": 3, "party": 3, "festival": 2, "anniversary": 3, "birthday": 3, "cheers": 2, "congrats": 2, "milestone": 2, "eid": 2, "puja": 2}},
+    "news":        {"tone": 0,  "emojis": ["📢", "📰", "🗞️", "🔔", "📣", "🆕", "👀"],
+                    "kw": {"news": 3, "announcement": 3, "update": 1, "breaking": 3, "report": 2, "alert": 1, "notice": 2, "important": 2, "headline": 2}},
+    "achievement": {"tone": 1,  "emojis": ["🏆", "🥇", "🎯", "🚀", "👏", "🙌", "⭐"],
+                    "kw": {"achievement": 3, "success": 3, "won": 2, "reached": 2, "goal": 2, "record": 2, "proud": 2, "accomplish": 2, "thank you": 1, "grateful": 1}},
+    "motivation":  {"tone": 1,  "emojis": ["💪", "🔥", "🚀", "🌟", "💯", "⚡", "🦁"],
+                    "kw": {"motivation": 3, "inspire": 3, "dream": 2, "hustle": 3, "grind": 2, "believe": 2, "mindset": 2, "success": 1, "never give up": 3, "discipline": 2}},
+    "question":    {"tone": 0,  "emojis": ["🤔", "❓", "💭", "👇", "🗳️", "💬", "👀"],
+                    "kw": {"?": 1, "poll": 3, "vote": 3, "question": 2, "what do you think": 3, "comment": 2, "your opinion": 3, "guess": 2}},
+    "thanks":      {"tone": 1,  "emojis": ["🙏", "❤️", "🥰", "🤝", "✨", "🙌", "💐"],
+                    "kw": {"thank": 3, "thanks": 3, "grateful": 3, "appreciate": 3, "gratitude": 3, "blessed": 2, "respect": 1}},
+    "sad":         {"tone": -1, "emojis": ["😢", "💔", "😞", "🥺", "😔", "🙏", "🕊️"],
+                    "kw": {"sad": 3, "sorry": 3, "miss": 1, "loss": 3, "rip": 3, "condolence": 3, "broken": 2, "cry": 2, "heartbroken": 3}},
+    "funny":       {"tone": 1,  "emojis": ["😂", "🤣", "😆", "😜", "🤪", "😅", "💀"],
+                    "kw": {"funny": 3, "lol": 3, "lmao": 3, "joke": 3, "haha": 3, "meme": 3, "comedy": 2, "hilarious": 3, "rofl": 3}},
+    "fashion":     {"tone": 1,  "emojis": ["👗", "👠", "💄", "🕶️", "👜", "✨", "💅"],
+                    "kw": {"fashion": 3, "style": 2, "outfit": 3, "dress": 2, "beauty": 2, "makeup": 3, "trend": 2, "collection": 2, "wear": 1, "clothing": 2}},
+    "sports":      {"tone": 1,  "emojis": ["⚽", "🏏", "🏀", "🥅", "🏆", "🔥", "🥇"],
+                    "kw": {"sports": 2, "football": 3, "cricket": 3, "match": 2, "team": 1, "goal": 1, "tournament": 2, "league": 2, "player": 1, "score": 1}},
+    "job":         {"tone": 1,  "emojis": ["💼", "📈", "🤝", "📝", "🏢", "🎯", "✅"],
+                    "kw": {"job": 3, "hiring": 3, "career": 3, "vacancy": 3, "apply": 2, "recruit": 3, "salary": 1, "interview": 2, "remote": 2, "position": 2, "opportunity": 2}},
+    "security":    {"tone": 0,  "emojis": ["🔒", "🛡️", "🔐", "✅", "⚠️", "🕵️", "🔑"],
+                    "kw": {"security": 3, "privacy": 3, "protect": 2, "safe": 2, "password": 2, "scam": 2, "verify": 2, "secure": 2, "fraud": 2, "encrypt": 2}},
+}
+
+AI_HOOKS = {
+    "sale":        ["🔥 BIG SALE IS LIVE — don't miss out!", "💸 Lowest price ever, today only!", "🛒 Grab yours before stock runs out!"],
+    "launch":      ["🚀 IT'S FINALLY HERE!", "✨ Introducing something special for you!", "🆕 Brand new — be the first to try it!"],
+    "giveaway":    ["🎁 GIVEAWAY ALERT — join now!", "🍀 Your lucky day starts here!", "🏆 Win big, it's totally free!"],
+    "love":        ["❤️ Made with love, just for you.", "🥰 You're going to adore this!", "💖 Spread the love today!"],
+    "gift":        ["🎁 A special gift is waiting for you!", "💝 Claim your free reward now!", "⭐ Exclusive bonus unlocked!"],
+    "urgent":      ["⏰ HURRY — offer ends very soon!", "🚨 Last chance, act now!", "‼️ Don't wait, this won't last!"],
+    "premium":     ["👑 Premium quality, premium feel.", "💎 Step into the VIP experience.", "🏆 Only the best, for the best."],
+    "money":       ["💰 Start earning today!", "📈 Turn your time into income!", "🤑 Real money, real results!"],
+    "crypto":      ["🚀 To the moon — don't miss this!", "🪙 The next big move starts now!", "💹 Smart money is already in!"],
+    "tech":        ["🤖 The future is here!", "💻 Smarter, faster, better!", "⚙️ Next-level tech, unlocked!"],
+    "gaming":      ["🎮 Game on — let's go!", "🏆 Level up like a pro!", "👾 New challenge awaits!"],
+    "music":       ["🎵 Press play and vibe!", "🎧 Your new favorite track is here!", "🔊 Turn it up loud!"],
+    "food":        ["😋 Too tasty to resist!", "🍔 Hungry yet? Dig in!", "🤤 Flavor you'll fall for!"],
+    "travel":      ["✈️ Adventure is calling!", "🌍 Pack your bags, let's explore!", "🏖️ Your dream trip starts here!"],
+    "fitness":     ["💪 Stronger every single day!", "🔥 No excuses — let's get it!", "🏋️ Transform starts today!"],
+    "education":   ["🎓 Learn it, master it!", "🧠 Level up your skills today!", "💡 Knowledge that pays off!"],
+    "celebrate":   ["🎉 Let's celebrate together!", "🥳 The party starts now!", "🎊 Big moment, big vibes!"],
+    "news":        ["📢 BIG announcement inside!", "🔔 You need to see this!", "🆕 Fresh update just dropped!"],
+    "achievement": ["🏆 We did it — thank you!", "🙌 A milestone worth celebrating!", "🎯 Goal smashed!"],
+    "motivation":  ["💪 Your time is NOW!", "🚀 Dream big, work hard!", "🔥 Keep pushing — you've got this!"],
+    "question":    ["🤔 What do you think? 👇", "🗳️ Vote and let us know!", "💬 Drop your answer below!"],
+    "thanks":      ["🙏 Thank you for the love!", "❤️ We appreciate you so much!", "🙌 Grateful for this community!"],
+    "sad":         ["🕊️ Sending love and strength.", "🙏 Stay strong, we're with you.", "💔 Tough times, but together we rise."],
+    "funny":       ["😂 You'll laugh, guaranteed!", "🤣 This one's too good!", "😜 Warning: highly addictive fun!"],
+    "fashion":     ["✨ Slay the look!", "👗 Style that turns heads!", "💄 Glow up time!"],
+    "sports":      ["🔥 Game day energy!", "🏆 Cheer for the win!", "⚽ Don't miss the action!"],
+    "job":         ["💼 We're hiring — apply now!", "🎯 Your next big role awaits!", "🤝 Join our growing team!"],
+    "security":    ["🔒 Stay safe, stay protected!", "🛡️ Your security comes first!", "🔐 Lock it down today!"],
+}
+
+AI_DEFAULT_EMOJIS = ["✨", "🔥", "⭐", "💯", "🚀", "👑", "🎯"]
+
+# Optional real-LLM upgrade. Disabled automatically when no key is configured.
+AI_LLM_ENABLED = bool(os.getenv("AI_API_KEY") or os.getenv("OPENAI_API_KEY"))
+AI_LLM_KEY = os.getenv("AI_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+AI_LLM_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
+AI_LLM_BASE = os.getenv("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+_ai_llm_cache = {}
+
+
+def _ai_tokenized(text):
+    return " " + re.sub(r"\s+", " ", (text or "").lower()) + " "
+
+
+def ai_analyze_text(text):
+    """Score every intent against the text and return a ranked analysis dict:
+    {intents: [(name, score)...], top: name, tone: 'positive'/'negative'/'neutral'}."""
+    blob = _ai_tokenized(text)
+    scores = {}
+    tone_score = 0
+    for name, spec in AI_INTENTS.items():
+        s = 0
+        for kw, w in spec["kw"].items():
+            if kw == "?":
+                s += w * blob.count("?")
+            elif " " in kw or not kw.isalpha():
+                if kw in blob:
+                    s += w
+            else:
+                # word-boundary match so "win" doesn't fire inside "window"
+                if re.search(r"\b" + re.escape(kw) + r"\b", blob):
+                    s += w
+        if s > 0:
+            scores[name] = s
+            tone_score += spec["tone"] * s
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    tone = "positive" if tone_score > 0 else ("negative" if tone_score < 0 else "neutral")
+    return {"intents": ranked, "top": (ranked[0][0] if ranked else None), "tone": tone}
+
+
+def ai_emoji_suggestions(text, limit=6):
+    """Ranked, de-duplicated unicode emoji list based on detected vibe.
+    Falls back to a tasteful default set when nothing is detected."""
+    # Try real LLM first (safe, cached, optional).
+    llm = ai_llm_suggest(text, want="emojis") if AI_LLM_ENABLED else None
+    if llm:
+        return llm[:limit]
+    analysis = ai_analyze_text(text)
+    out, seen = [], set()
+    for name, _score in analysis["intents"]:
+        for e in AI_INTENTS[name]["emojis"]:
+            if e not in seen:
+                seen.add(e)
+                out.append(e)
+            if len(out) >= limit:
+                return out
+    for e in AI_DEFAULT_EMOJIS:
         if e not in seen:
             seen.add(e)
-            res.append(e)
-    return res[:5]
+            out.append(e)
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+# Backward-compatible alias used by inline mode and older call sites.
+def smart_emoji_suggestions(text):
+    return ai_emoji_suggestions(text, limit=5)
+
+
+def ai_generate_hook(text, seed_shift=0):
+    """Pick a catchy hook line matched to the post's strongest intent."""
+    llm = ai_llm_suggest(text, want="hook") if AI_LLM_ENABLED else None
+    if llm and isinstance(llm, str) and llm.strip():
+        return llm.strip()
+    analysis = ai_analyze_text(text)
+    top = analysis["top"]
+    pool = AI_HOOKS.get(top) if top else None
+    if not pool:
+        pool = ["✨ Don't miss this!", "🔥 You'll love this one!", "🚀 Big things inside!"]
+    idx = (_stable_seed(text) + seed_shift) % len(pool)
+    return pool[idx]
+
+
+def ai_sprinkle_text(text, density=2):
+    """Insert intent-matched emojis at the end of sentences for an engaging look."""
+    try:
+        emos = ai_emoji_suggestions(text, limit=max(2, density + 1))
+        if not emos:
+            return text
+        parts = re.split(r"(\n+|(?<=[.!?])\s+)", text or "")
+        out, ei = [], 0
+        for chunk in parts:
+            out.append(chunk)
+            if chunk.strip() and not chunk.startswith("\n") and len(chunk.strip()) > 8:
+                out.append(" " + emos[ei % len(emos)])
+                ei += 1
+        result = "".join(out).strip()
+        return result or text
+    except Exception:
+        return text
+
+
+def ai_vibe_label(text):
+    analysis = ai_analyze_text(text)
+    top = analysis["top"]
+    name = (top or "general").replace("_", " ").title()
+    tone_icon = {"positive": "📈", "negative": "🛟", "neutral": "🎯"}.get(analysis["tone"], "🎯")
+    return f"{name} · {analysis['tone'].title()} {tone_icon}"
+
+
+def ai_llm_suggest(text, want="emojis"):
+    """Optional OpenAI-compatible call. Returns list (emojis) or str (hook),
+    or None on any failure so callers fall back to the local engine."""
+    if not AI_LLM_ENABLED or not (text or "").strip():
+        return None
+    cache_key = f"{want}:{(text or '').strip().lower()[:160]}"
+    cached = _ai_llm_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        if want == "hook":
+            prompt = ("Write ONE short, catchy marketing hook line (max 8 words) for this "
+                      "Telegram post. Include 1-2 fitting emojis. Reply with only the line.\n\nPost:\n" + text[:600])
+        else:
+            prompt = ("Suggest 6 emojis that best match the vibe of this Telegram post. "
+                      "Reply with only the emojis, no spaces, no text.\n\nPost:\n" + text[:600])
+        payload = json.dumps({
+            "model": AI_LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_tokens": 60,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            AI_LLM_BASE + "/chat/completions",
+            data=payload,
+            headers={"Authorization": f"Bearer {AI_LLM_KEY}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        content = (data["choices"][0]["message"]["content"] or "").strip()
+        if want == "hook":
+            result = content.splitlines()[0].strip().strip('"') if content else None
+        else:
+            spans = _emoji_spans(content)
+            result = [val for _s, _e, val in spans] or None
+        _ai_llm_cache[cache_key] = result
+        return result
+    except Exception:
+        log_exc("ai_llm_suggest")
+        _ai_llm_cache[cache_key] = None
+        return None
 
 # ======================== KEYBOARDS ========================
 def main_menu():
@@ -2325,10 +2554,79 @@ def action_markup(uid):
     m = types.InlineKeyboardMarkup(row_width=2)
     m.add(i_btn("EMOJI PICKER", f"wizard:emojimanual:{uid}", "success", "emoji"),
           i_btn("REFRESH", f"wizard:refresh:{uid}", "primary", "success"))
-    m.add(i_btn("AI SUGGEST", f"wizard:ai:{uid}", "success", "emoji"),
+    m.add(i_btn("AI STUDIO", f"wizard:aistudio:{uid}", "success", "emoji"),
           i_btn("DELETE", f"wizard:delete:{uid}", "danger", "danger"))
     m.add(i_btn("DONE", f"wizard:done:{uid}", "success", "success"))
     return m
+
+
+def ai_studio_markup(uid):
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.add(i_btn("ADD SMART EMOJIS", f"wizard:aiemoji:{uid}", "success", "emoji"),
+          i_btn("ADD HOOK LINE", f"wizard:aihook:{uid}", "success", "make_post"))
+    m.add(i_btn("SPRINKLE INLINE", f"wizard:aisprinkle:{uid}", "primary", "emoji"),
+          i_btn("MAX BOOST", f"wizard:aiboost:{uid}", "primary", "spam"))
+    m.add(i_btn("REGENERATE", f"wizard:airegen:{uid}", "primary", "success"),
+          i_btn("CLEAR AI", f"wizard:aiclear:{uid}", "danger", "back"))
+    m.add(i_btn("BACK TO POST", f"wizard:aiback:{uid}", "success", "success"))
+    return m
+
+
+def ai_compose(uid):
+    """Rebuild the post text from the pristine base + the AI add-ons the user
+    has toggled, so AI actions never stack or corrupt the original message."""
+    data = temp_data.get(uid) or {}
+    base = data.get("original_text_pristine")
+    if base is None:
+        base = data.get("original_text") or ""
+        data["original_text_pristine"] = base
+    hook = data.get("ai_hook")
+    emojis = data.get("ai_emoji_add") or ""
+    sprinkle = data.get("ai_sprinkle")
+    body = ai_sprinkle_text(base) if sprinkle else base
+    text = body
+    if emojis:
+        text = (text + "  " + emojis).strip()
+    if hook:
+        text = hook + "\n\n" + text
+    data["original_text"] = text
+    temp_data[uid] = data
+    if data.get("emoji_mode") == "manual":
+        init_manual_emoji_selector(uid, keep_existing=True)
+    rebuild_post_conversion(uid, randomize=False, allow_resolve=True)
+
+
+def send_ai_studio(chat_id, uid):
+    try:
+        data = temp_data.get(uid) or {}
+        base = data.get("original_text_pristine") or data.get("original_text") or ""
+        vibe = ai_vibe_label(base)
+        sug = " ".join(ai_emoji_suggestions(base, limit=6))
+        hook_on = "ON" if data.get("ai_hook") else "off"
+        emoji_on = "ON" if data.get("ai_emoji_add") else "off"
+        sprinkle_on = "ON" if data.get("ai_sprinkle") else "off"
+        text = (
+            f"{premium_header('AI STUDIO')}\n\n"
+            f"{P} Detected Vibe : {vibe}\n"
+            f"{P} Top Emojis    : {sug}\n\n"
+            f"{P} Smart Emojis  : {emoji_on}\n"
+            f"{P} Hook Line     : {hook_on}\n"
+            f"{P} Inline Sprinkle: {sprinkle_on}\n\n"
+            f"{P} ADD SMART EMOJIS = vibe-matched premium set\n"
+            f"{P} ADD HOOK LINE = catchy headline on top\n"
+            f"{P} SPRINKLE INLINE = emojis between sentences\n"
+            f"{P} MAX BOOST = hook + emojis + sprinkle\n"
+            f"{P} REGENERATE = fresh AI variation\n"
+            f"{premium_footer()}"
+        )
+        act = _send_pe(chat_id, text, use_main=False, reply_markup=ai_studio_markup(uid))
+        if act:
+            data.setdefault("ai_studio_msgs", [])
+            data["ai_studio_msgs"].append(act.message_id)
+            temp_data[uid] = data
+        track_event("ai_studio_open", uid)
+    except Exception:
+        log_exc("send_ai_studio")
 
 def send_preview_and_actions(chat_id, uid):
     try:
@@ -2351,7 +2649,7 @@ def send_preview_and_actions(chat_id, uid):
             f"{P} Your premium post is ready above.\n\n"
             f"{P} EMOJI PICKER = fine-tune each emoji\n"
             f"{P} REFRESH = reshuffle premium style\n"
-            f"{P} AI SUGGEST = add catchy hooks\n"
+            f"{P} AI STUDIO = smart emojis, hooks & boost\n"
             f"{P} DELETE = remove this preview\n"
             f"{P} DONE = finish & post\n"
             f"{premium_footer()}",
@@ -2872,6 +3170,10 @@ def process_post_content(message):
         pack_slug = smart_pack_for_text(original_text, uid) if user_auto_pack(uid) else get_user_pack_slug(uid)
         temp_data[uid] = {
             "original_text": original_text,
+            "original_text_pristine": original_text,
+            "ai_hook": None,
+            "ai_emoji_add": "",
+            "ai_sprinkle": False,
             "original_entities": original_entities,
             "photo_id": message.photo[-1].file_id if message.content_type == "photo" else None,
             "document_id": message.document.file_id if message.content_type == "document" else None,
@@ -3020,13 +3322,63 @@ def wizard_callbacks(call):
                 temp_data[uid] = data
                 rebuild_post_conversion(uid, randomize=True)
             send_preview_and_actions(chat_id, uid)
-        elif action == "ai":
+        elif action == "aistudio":
+            send_ai_studio(chat_id, uid)
+        elif action == "aiemoji":
             data = temp_data[uid]
-            data["original_text"] = (data.get("original_text") or "") + " " + "".join(smart_emoji_suggestions(data.get("original_text")))
+            base = data.get("original_text_pristine") or data.get("original_text") or ""
+            data["ai_emoji_add"] = " ".join(ai_emoji_suggestions(base, limit=5))
             temp_data[uid] = data
-            if data.get("emoji_mode") == "manual":
-                init_manual_emoji_selector(uid, keep_existing=True)
-            rebuild_post_conversion(uid, randomize=False)
+            ai_compose(uid)
+            bot.answer_callback_query(call.id, "Smart emojis added.")
+            send_preview_and_actions(chat_id, uid)
+        elif action == "aihook":
+            data = temp_data[uid]
+            base = data.get("original_text_pristine") or data.get("original_text") or ""
+            data["ai_hook"] = ai_generate_hook(base, seed_shift=int(data.get("ai_seed", 0) or 0))
+            temp_data[uid] = data
+            ai_compose(uid)
+            bot.answer_callback_query(call.id, "Hook line added.")
+            send_preview_and_actions(chat_id, uid)
+        elif action == "aisprinkle":
+            data = temp_data[uid]
+            data["ai_sprinkle"] = not bool(data.get("ai_sprinkle"))
+            temp_data[uid] = data
+            ai_compose(uid)
+            bot.answer_callback_query(call.id, "Inline sprinkle toggled.")
+            send_preview_and_actions(chat_id, uid)
+        elif action == "aiboost":
+            data = temp_data[uid]
+            base = data.get("original_text_pristine") or data.get("original_text") or ""
+            data["ai_hook"] = ai_generate_hook(base, seed_shift=int(data.get("ai_seed", 0) or 0))
+            data["ai_emoji_add"] = " ".join(ai_emoji_suggestions(base, limit=6))
+            data["ai_sprinkle"] = True
+            temp_data[uid] = data
+            ai_compose(uid)
+            bot.answer_callback_query(call.id, "Max boost applied!")
+            send_preview_and_actions(chat_id, uid)
+        elif action == "airegen":
+            data = temp_data[uid]
+            data["ai_seed"] = int(data.get("ai_seed", 0) or 0) + 1
+            base = data.get("original_text_pristine") or data.get("original_text") or ""
+            if data.get("ai_hook"):
+                data["ai_hook"] = ai_generate_hook(base, seed_shift=data["ai_seed"])
+            if data.get("ai_emoji_add"):
+                data["ai_emoji_add"] = " ".join(ai_emoji_suggestions(base, limit=5))
+            temp_data[uid] = data
+            ai_compose(uid)
+            bot.answer_callback_query(call.id, "Regenerated.")
+            send_preview_and_actions(chat_id, uid)
+        elif action == "aiclear":
+            data = temp_data[uid]
+            data["ai_hook"] = None
+            data["ai_emoji_add"] = ""
+            data["ai_sprinkle"] = False
+            temp_data[uid] = data
+            ai_compose(uid)
+            bot.answer_callback_query(call.id, "AI add-ons cleared.")
+            send_preview_and_actions(chat_id, uid)
+        elif action == "aiback":
             send_preview_and_actions(chat_id, uid)
         elif action == "delete":
             data = temp_data.pop(uid, {})
